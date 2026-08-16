@@ -16,8 +16,10 @@ WAKE_TIMEOUT = float(os.getenv("WAKE_TIMEOUT", "30"))
 
 def wake_service(name, url):
     try:
-        wake_path = "/health" if name == "kick" else "/"
-        r = requests.get(url.rstrip("/") + wake_path, timeout=WAKE_TIMEOUT)
+        # Use the root endpoint for all services. The Kick API is known to
+        # return HTTP 200 there; this avoids depending on a /health route
+        # that may not exist on older deployed versions.
+        r = requests.get(url.rstrip("/") + "/", timeout=WAKE_TIMEOUT)
         return {"service": name, "status": r.status_code, "ok": r.status_code < 500}
     except requests.RequestException as e:
         return {"service": name, "status": None, "ok": False, "error": type(e).__name__}
@@ -64,7 +66,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "services": SERVICES,
         "routes": ["/wake", "/kick/<rota>", "/warzone/<rota>", "/redsec/<rota>"],
     })

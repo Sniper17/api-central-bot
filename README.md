@@ -1,13 +1,13 @@
-# API Central v2.1
+# API Central v2.2
 
 Correção do wake-up da Kick.
 
-O Render gratuito pode demorar mais de 8 segundos para acordar uma aplicação.
-Por isso a central agora:
-- aguarda até 30 segundos por um serviço durante `/wake`;
-- consulta `/health` da Kick para o wake, em vez de `/`;
-- mantém Warzone e RedSec como estavam;
-- preserva o proxy `/kick/<rota>`, `/warzone/<rota>` e `/redsec/<rota>`.
+A Kick v13.7.1 responde HTTP 200 no endpoint `/`, então a central usa `/`
+para acordar os três serviços. Não depende de `/health` da Kick.
 
-Não altere ainda os comandos do StreamElements.
-Primeiro confirme `/health` e `/wake`.
+- timeout de wake: 30s
+- Kick: https://kick-duelo-api.onrender.com/
+- Warzone: https://warzone-api-qbn9.onrender.com/
+- RedSec: https://redsec-loadout-api.onrender.com/
+
+Não altere os comandos do StreamElements ainda.
