@@ -1,4 +1,5 @@
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, jsonify, request
 import requests
@@ -14,32 +15,72 @@ SERVICES = {
 TIMEOUT = float(os.getenv("PROXY_TIMEOUT", "20"))
 WAKE_TIMEOUT = float(os.getenv("WAKE_TIMEOUT", "30"))
 
+warmup_lock = threading.Lock()
+warmup_running = False
+
 def wake_service(name, url):
     try:
-        # Use the root endpoint for all services. The Kick API is known to
-        # return HTTP 200 there; this avoids depending on a /health route
-        # that may not exist on older deployed versions.
+        # Root endpoint is known to answer on all three current APIs.
         r = requests.get(url.rstrip("/") + "/", timeout=WAKE_TIMEOUT)
         return {"service": name, "status": r.status_code, "ok": r.status_code < 500}
     except requests.RequestException as e:
-        return {"service": name, "status": None, "ok": False, "error": type(e).__name__}
+        return {
+            "service": name,
+            "status": None,
+            "ok": False,
+            "error": type(e).__name__,
+            "detail": str(e)[:180],
+        }
 
 def wake_all():
     with ThreadPoolExecutor(max_workers=3) as pool:
-        list(pool.map(lambda item: wake_service(*item), SERVICES.items()))
+        futures = [
+            pool.submit(wake_service, name, url)
+            for name, url in SERVICES.items()
+        ]
+        return [f.result() for f in futures]
 
-def background_wake():
-    # Fire-and-forget: don't make the user's command wait for the other APIs.
-    pool = ThreadPoolExecutor(max_workers=3)
-    pool.submit(wake_all)
-    pool.shutdown(wait=False)
+def warm_all_blocking():
+    """Warm all services in parallel; used by the persistent worker."""
+    try:
+        results = wake_all()
+        app.logger.info("Warm-up: %s", results)
+    except Exception as e:
+        app.logger.exception("Warm-up failed: %s", e)
+
+def start_warmup():
+    """
+    Start a detached warm-up thread.
+
+    It deliberately does not wait for the sleeping APIs. The request that
+    triggered it can return immediately, while this process continues the
+    outbound requests. A lock prevents several chat commands from creating
+    many simultaneous wake storms.
+    """
+    global warmup_running
+    with warmup_lock:
+        if warmup_running:
+            return False
+        warmup_running = True
+
+    def runner():
+        global warmup_running
+        try:
+            warm_all_blocking()
+        finally:
+            with warmup_lock:
+                warmup_running = False
+
+    threading.Thread(target=runner, name="api-warmup", daemon=True).start()
+    return True
+
 
 def proxy(service, path):
     if service not in SERVICES:
         return Response("Serviço não encontrado.", status=404)
 
-    # Every command also triggers the three warm-up calls.
-    background_wake()
+    # Every proxied command triggers one non-blocking warm-up of all APIs.
+    start_warmup()
 
     target = SERVICES[service].rstrip("/") + "/" + path.lstrip("/")
     try:
@@ -59,14 +100,15 @@ def proxy(service, path):
 
 @app.get("/")
 def home():
-    return "🌐 API CENTRAL v2 ONLINE • /health • /wake"
+    return "🌐 API CENTRAL v3 ONLINE • /health • /wake"
 
 @app.get("/health")
 def health():
+    start_warmup()
     return jsonify({
         "ok": True,
         "service": "api-central",
-        "version": "2.2.0",
+        "version": "3.0.0",
         "services": SERVICES,
         "routes": ["/wake", "/kick/<rota>", "/warzone/<rota>", "/redsec/<rota>"],
     })
