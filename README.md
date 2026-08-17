@@ -22,3 +22,6 @@ TESTE:
 Se o Render matar a instância da central imediatamente após a resposta, o
 warm-up em background não poderá continuar; nesse caso a solução B (celular
 ou outro host sempre ligado) será a mais confiável.
+
+
+Versão atualizada: /wake aguarda a API alvo ficar realmente disponível e aceita ?service=redsec ou ?service=warzone.

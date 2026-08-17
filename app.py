@@ -24,92 +24,92 @@ SERVICES = {
 # Acordar uma API do Render pode levar alguns segundos.
 # O /wake precisa terminar antes do timeout do worker da Central.
 # Os requests são curtos e independentes: uma API ruim não trava as outras.
-REQUEST_TIMEOUT = float(os.getenv("WAKE_REQUEST_TIMEOUT", "8"))
-RETRIES = int(os.getenv("WAKE_RETRIES", "1"))
-RETRY_DELAY = float(os.getenv("WAKE_RETRY_DELAY", "1"))
+# O Render Free pode levar cerca de um minuto para sair do cold start.
+# A Central fica aguardando a API realmente responder antes de devolver sucesso.
+WAKE_REQUEST_TIMEOUT = max(5.0, float(os.getenv("WAKE_REQUEST_TIMEOUT", "12")))
+WAKE_MAX_WAIT = max(60.0, float(os.getenv("WAKE_MAX_WAIT", "120")))
+WAKE_POLL_INTERVAL = max(2.0, float(os.getenv("WAKE_POLL_INTERVAL", "4")))
+
+# Mantidos por compatibilidade com variáveis antigas.
+REQUEST_TIMEOUT = WAKE_REQUEST_TIMEOUT
+RETRIES = int(os.getenv("WAKE_RETRIES", "0"))
+RETRY_DELAY = WAKE_POLL_INTERVAL
 
 
 def wake_service(name, base_url):
-    """
-    Faz GET na raiz da API para provocar cold start.
-
-    Cada serviço é tratado isoladamente. Se uma API retornar 502 ou
-    estourar o timeout, registramos o erro e seguimos sem bloquear
-    os outros serviços nem o /wake da Central.
-    """
+    """Acorda uma API e só retorna sucesso quando ela estiver respondendo."""
     url = base_url + "/"
+    started = time.time()
+    deadline = started + WAKE_MAX_WAIT
+    attempt = 0
     last_status = None
     last_error = None
-    started = time.time()
 
-    for attempt in range(1, RETRIES + 2):
+    while time.time() < deadline:
+        attempt += 1
         attempt_started = time.time()
+        remaining = max(1.0, deadline - time.time())
+        timeout = min(WAKE_REQUEST_TIMEOUT, remaining)
 
         try:
             print(
-                f"[WAKE] {name}: tentativa {attempt} -> {url}",
-                flush=True
+                f"[WAKE] {name}: tentativa {attempt} -> {url} "
+                f"(restam {remaining:.1f}s)",
+                flush=True,
             )
-
             response = requests.get(
                 url,
-                timeout=REQUEST_TIMEOUT,
+                timeout=timeout,
                 allow_redirects=True,
             )
             last_status = response.status_code
-            elapsed_attempt = time.time() - attempt_started
-            elapsed_total = time.time() - started
+            elapsed = time.time() - started
 
             print(
                 f"[WAKE] {name}: HTTP {response.status_code} "
-                f"em {elapsed_attempt:.1f}s (total {elapsed_total:.1f}s)",
-                flush=True
+                f"em {time.time()-attempt_started:.1f}s (total {elapsed:.1f}s)",
+                flush=True,
             )
 
-            # 2xx/3xx = serviço respondeu e está acordado.
             if 200 <= response.status_code < 400:
                 return {
                     "ok": True,
                     "service": name,
                     "status": response.status_code,
                     "attempt": attempt,
-                    "elapsed": round(elapsed_total, 1),
+                    "elapsed": round(elapsed, 1),
                 }
 
-            last_error = (
-                f"HTTP {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
 
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            elapsed_total = time.time() - started
-
             print(
-                f"[WAKE] {name}: erro na tentativa {attempt}: "
-                f"{last_error} (total {elapsed_total:.1f}s)",
-                flush=True
+                f"[WAKE] {name}: erro na tentativa {attempt}: {last_error}",
+                flush=True,
             )
 
-        # No máximo uma nova tentativa curta.
-        if attempt <= RETRIES:
-            time.sleep(RETRY_DELAY)
+        if time.time() + WAKE_POLL_INTERVAL >= deadline:
+            break
+        print(
+            f"[WAKE] {name}: ainda iniciando. Nova verificação em "
+            f"{WAKE_POLL_INTERVAL:.1f}s.",
+            flush=True,
+        )
+        time.sleep(WAKE_POLL_INTERVAL)
 
-    elapsed_total = time.time() - started
-
+    elapsed = time.time() - started
     print(
-        f"[WAKE] {name}: desistindo após {RETRIES + 1} tentativa(s) "
-        f"em {elapsed_total:.1f}s. A Central continuará normalmente.",
-        flush=True
+        f"[WAKE] {name}: não ficou pronto dentro de {elapsed:.1f}s.",
+        flush=True,
     )
-
     return {
         "ok": False,
         "service": name,
         "status": last_status,
-        "attempt": RETRIES + 1,
-        "elapsed": round(elapsed_total, 1),
-        "error": last_error,
+        "attempt": attempt,
+        "elapsed": round(elapsed, 1),
+        "error": last_error or "tempo máximo de espera atingido",
     }
 
 
@@ -118,7 +118,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-safe-parallel-v3",
+        "version": "wake-until-ready-v4",
         "services": SERVICES,
         "wake": {
             "timeout_seconds": REQUEST_TIMEOUT,
@@ -133,35 +133,44 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-safe-parallel-v3",
+        "version": "wake-until-ready-v4",
     })
 
 
 @app.get("/wake")
 def wake():
+    """
+    /wake sem parâmetro acorda os três serviços em paralelo.
+    /wake?service=redsec ou /wake?service=warzone acorda somente o alvo
+    necessário para um comando, aguardando ele ficar realmente pronto.
+    """
+    requested = (request.args.get("service") or "").strip().lower()
+    if requested and requested not in SERVICES:
+        return jsonify({
+            "ok": False,
+            "error": f"Serviço inválido: {requested}",
+            "available": sorted(SERVICES),
+        }), 400
+
+    selected = {requested: SERVICES[requested]} if requested else SERVICES
+
     print("========================================", flush=True)
     print("[CENTRAL WAKE] Solicitação recebida.", flush=True)
     print(
-        f"[CENTRAL WAKE] timeout={REQUEST_TIMEOUT}s "
-        f"retries={RETRIES} delay={RETRY_DELAY}s",
-        flush=True
-    )
-    print(
-        "[CENTRAL WAKE] Kick, RedSec e Warzone serão acionados "
-        "em paralelo; falha de um não bloqueia os demais.",
-        flush=True
+        f"[CENTRAL WAKE] alvo={requested or 'todos'} "
+        f"max_wait={WAKE_MAX_WAIT}s poll={WAKE_POLL_INTERVAL}s",
+        flush=True,
     )
 
     started = time.time()
     results = []
 
-    # Os três serviços são chamados em paralelo.
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(SERVICES)
+        max_workers=len(selected)
     ) as executor:
         futures = {
             executor.submit(wake_service, name, url): name
-            for name, url in SERVICES.items()
+            for name, url in selected.items()
         }
 
         for future in concurrent.futures.as_completed(futures):
@@ -169,7 +178,6 @@ def wake():
             try:
                 result = future.result()
             except Exception as exc:
-                # Uma exceção inesperada de um serviço não derruba o /wake.
                 result = {
                     "ok": False,
                     "service": name,
@@ -178,11 +186,7 @@ def wake():
                     "elapsed": 0,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
-                print(
-                    f"[WAKE] {name}: exceção isolada: {exc}",
-                    flush=True
-                )
-
+                print(f"[WAKE] {name}: exceção isolada: {exc}", flush=True)
             results.append(result)
 
     results.sort(key=lambda item: item["service"])
@@ -192,23 +196,20 @@ def wake():
     print(
         f"[CENTRAL WAKE] Concluído em {total_elapsed:.1f}s. "
         f"overall_ok={overall_ok}",
-        flush=True
+        flush=True,
     )
     for item in results:
         print(
-            f"[CENTRAL WAKE] {item['service']} -> "
-            f"HTTP {item.get('status')} | ok={item['ok']} | "
-            f"tentativa={item.get('attempt')} | "
+            f"[CENTRAL WAKE] {item['service']} -> HTTP {item.get('status')} | "
+            f"ok={item['ok']} | tentativa={item.get('attempt')} | "
             f"tempo={item.get('elapsed')}s",
-            flush=True
+            flush=True,
         )
     print("========================================", flush=True)
 
-    # Mantém HTTP 200 para o Worker receber o diagnóstico mesmo quando
-    # uma API downstream estiver fria/indisponível.
     return jsonify({
         "ok": overall_ok,
-        "message": "Serviços acionados em paralelo.",
+        "message": "Serviço pronto." if requested else "Serviços prontos.",
         "elapsed": round(total_elapsed, 1),
         "services": results,
     }), 200
