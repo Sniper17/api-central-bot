@@ -7,11 +7,10 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+# O Kick Worker chama /wake a partir de um evento recebido.
+# Portanto NÃO devemos chamar o próprio Kick Worker novamente:
+# isso gera requisições desnecessárias/429 e pode contribuir para timeout.
 SERVICES = {
-    "kick": os.getenv(
-        "KICK_WORKER_URL",
-        "https://sn7-kick-worker.onrender.com"
-    ).strip().rstrip("/"),
     "redsec": os.getenv(
         "REDSEC_API_URL",
         "https://redsec-loadout-api.onrender.com"
@@ -24,10 +23,10 @@ SERVICES = {
 
 # Render Free pode colocar o serviço para dormir.
 # Acordar uma API pode demorar dezenas de segundos.
-# Cold start: dar tempo suficiente ao Render para levantar serviços Free.
+# Cold start do Render Free.
 REQUEST_TIMEOUT = int(os.getenv("WAKE_REQUEST_TIMEOUT", "25"))
-RETRIES = int(os.getenv("WAKE_RETRIES", "4"))
-RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "15"))
+RETRIES = int(os.getenv("WAKE_RETRIES", "3"))
+RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "12"))
 
 
 def wake_service(name, base_url):
@@ -102,7 +101,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v4-kick-ranking",
+        "version": "wake-v5-no-self-kick",
         "services": SERVICES,
     })
 
@@ -112,7 +111,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v4",
+        "version": "wake-v5-no-self-kick",
     })
 
 
@@ -128,17 +127,11 @@ def wake():
 
     results = []
 
-    # Paralelo para não somar o tempo de cold start das APIs.
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(SERVICES)
-    ) as executor:
-        futures = [
-            executor.submit(wake_service, name, url)
-            for name, url in SERVICES.items()
-        ]
-
-        for future in futures:
-            results.append(future.result())
+    # Não chamamos o Kick Worker: ele já está acordado e foi quem
+    # iniciou este /wake. Acordamos somente as APIs downstream.
+    # Sequencial evita dois cold starts pesados simultaneamente no plano Free.
+    for name, url in SERVICES.items():
+        results.append(wake_service(name, url))
 
     overall_ok = all(item["ok"] for item in results)
 
