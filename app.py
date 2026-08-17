@@ -24,10 +24,10 @@ SERVICES = {
 
 # Render Free pode colocar o serviço para dormir.
 # Acordar uma API pode demorar dezenas de segundos.
-# Configuração de cold start compatível com o timeout do Kick Worker.
+# Cold start: dar tempo suficiente ao Render para levantar serviços Free.
 REQUEST_TIMEOUT = int(os.getenv("WAKE_REQUEST_TIMEOUT", "25"))
-RETRIES = int(os.getenv("WAKE_RETRIES", "3"))
-RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "4"))
+RETRIES = int(os.getenv("WAKE_RETRIES", "4"))
+RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "15"))
 
 
 def wake_service(name, base_url):
@@ -76,18 +76,6 @@ def wake_service(name, base_url):
                 f"{response.text[:300]}"
             )
 
-            # Cold start do Render costuma aparecer como 502/503/504.
-            # Nesses casos vale repetir. Erros 4xx não precisam de retry.
-            if response.status_code not in (502, 503, 504):
-                break
-
-            if attempt <= RETRIES:
-                print(
-                    f"[WAKE] {name}: HTTP {response.status_code}; "
-                    f"novo retry em {RETRY_DELAY}s.",
-                    flush=True
-                )
-
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             print(
@@ -95,12 +83,6 @@ def wake_service(name, base_url):
                 f"{last_error}",
                 flush=True
             )
-
-            if attempt <= RETRIES:
-                print(
-                    f"[WAKE] {name}: novo retry em {RETRY_DELAY}s.",
-                    flush=True
-                )
 
         if attempt <= RETRIES:
             time.sleep(RETRY_DELAY)
@@ -120,7 +102,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v3-kick-ranking",
+        "version": "wake-retry-root-v4-kick-ranking",
         "services": SERVICES,
     })
 
@@ -130,7 +112,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v3",
+        "version": "wake-retry-root-v4",
     })
 
 
