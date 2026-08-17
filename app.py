@@ -1,4 +1,3 @@
-
 import os
 import time
 import concurrent.futures
@@ -7,10 +6,11 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# O Kick Worker chama /wake a partir de um evento recebido.
-# Portanto NÃO devemos chamar o próprio Kick Worker novamente:
-# isso gera requisições desnecessárias/429 e pode contribuir para timeout.
 SERVICES = {
+    "kick": os.getenv(
+        "KICK_WORKER_URL",
+        "https://sn7-kick-worker.onrender.com"
+    ).strip().rstrip("/"),
     "redsec": os.getenv(
         "REDSEC_API_URL",
         "https://redsec-loadout-api.onrender.com"
@@ -21,44 +21,30 @@ SERVICES = {
     ).strip().rstrip("/"),
 }
 
-# Rotas REAIS das APIs usadas pelos comandos do bot.
-# RedSec: !bf -> /classe?arma=...
-# Warzone: !classe/!meta -> /meta?tipo=...
-REDSEC_WAKE_PATH = os.getenv(
-    "REDSEC_WAKE_PATH",
-    "/classe?arma=svd"
-).strip()
-
-WARZONE_WAKE_PATH = os.getenv(
-    "WARZONE_WAKE_PATH",
-    "/meta?tipo=ar"
-).strip()
-
-# Render Free pode colocar o serviço para dormir.
-# Acordar uma API pode demorar dezenas de segundos.
-# Cold start do Render Free.
-REQUEST_TIMEOUT = int(os.getenv("WAKE_REQUEST_TIMEOUT", "25"))
-RETRIES = int(os.getenv("WAKE_RETRIES", "3"))
-RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "12"))
+# Acordar uma API do Render pode levar alguns segundos.
+# O /wake precisa terminar antes do timeout do worker da Central.
+# Os requests são curtos e independentes: uma API ruim não trava as outras.
+REQUEST_TIMEOUT = float(os.getenv("WAKE_REQUEST_TIMEOUT", "8"))
+RETRIES = int(os.getenv("WAKE_RETRIES", "1"))
+RETRY_DELAY = float(os.getenv("WAKE_RETRY_DELAY", "1"))
 
 
 def wake_service(name, base_url):
     """
-    Faz GET em uma rota real da API para provocar cold start.
-    Usa as mesmas rotas que o bot utiliza para entregar os loadouts.
-    """
-    if name == "redsec":
-        url = base_url + REDSEC_WAKE_PATH
-    elif name == "warzone":
-        url = base_url + WARZONE_WAKE_PATH
-    else:
-        url = base_url + "/"
+    Faz GET na raiz da API para provocar cold start.
 
+    Cada serviço é tratado isoladamente. Se uma API retornar 502 ou
+    estourar o timeout, registramos o erro e seguimos sem bloquear
+    os outros serviços nem o /wake da Central.
+    """
+    url = base_url + "/"
     last_status = None
     last_error = None
     started = time.time()
 
     for attempt in range(1, RETRIES + 2):
+        attempt_started = time.time()
+
         try:
             print(
                 f"[WAKE] {name}: tentativa {attempt} -> {url}",
@@ -71,22 +57,23 @@ def wake_service(name, base_url):
                 allow_redirects=True,
             )
             last_status = response.status_code
+            elapsed_attempt = time.time() - attempt_started
+            elapsed_total = time.time() - started
 
             print(
                 f"[WAKE] {name}: HTTP {response.status_code} "
-                f"em {time.time() - started:.1f}s",
+                f"em {elapsed_attempt:.1f}s (total {elapsed_total:.1f}s)",
                 flush=True
             )
 
-            # Qualquer resposta HTTP significa que o serviço respondeu.
-            # 2xx/3xx é considerado sucesso.
+            # 2xx/3xx = serviço respondeu e está acordado.
             if 200 <= response.status_code < 400:
                 return {
                     "ok": True,
                     "service": name,
                     "status": response.status_code,
                     "attempt": attempt,
-                    "elapsed": round(time.time() - started, 1),
+                    "elapsed": round(elapsed_total, 1),
                 }
 
             last_error = (
@@ -96,21 +83,32 @@ def wake_service(name, base_url):
 
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            elapsed_total = time.time() - started
+
             print(
                 f"[WAKE] {name}: erro na tentativa {attempt}: "
-                f"{last_error}",
+                f"{last_error} (total {elapsed_total:.1f}s)",
                 flush=True
             )
 
+        # No máximo uma nova tentativa curta.
         if attempt <= RETRIES:
             time.sleep(RETRY_DELAY)
+
+    elapsed_total = time.time() - started
+
+    print(
+        f"[WAKE] {name}: desistindo após {RETRIES + 1} tentativa(s) "
+        f"em {elapsed_total:.1f}s. A Central continuará normalmente.",
+        flush=True
+    )
 
     return {
         "ok": False,
         "service": name,
         "status": last_status,
         "attempt": RETRIES + 1,
-        "elapsed": round(time.time() - started, 1),
+        "elapsed": round(elapsed_total, 1),
         "error": last_error,
     }
 
@@ -120,8 +118,13 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-v6-real-routes",
+        "version": "wake-safe-parallel-v3",
         "services": SERVICES,
+        "wake": {
+            "timeout_seconds": REQUEST_TIMEOUT,
+            "retries": RETRIES,
+            "retry_delay_seconds": RETRY_DELAY,
+        },
     })
 
 
@@ -130,7 +133,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-v6-real-routes",
+        "version": "wake-safe-parallel-v3",
     })
 
 
@@ -140,34 +143,78 @@ def wake():
     print("[CENTRAL WAKE] Solicitação recebida.", flush=True)
     print(
         f"[CENTRAL WAKE] timeout={REQUEST_TIMEOUT}s "
-        f"retries={RETRIES}",
+        f"retries={RETRIES} delay={RETRY_DELAY}s",
+        flush=True
+    )
+    print(
+        "[CENTRAL WAKE] Kick, RedSec e Warzone serão acionados "
+        "em paralelo; falha de um não bloqueia os demais.",
         flush=True
     )
 
+    started = time.time()
     results = []
 
-    # Não chamamos o Kick Worker: ele já está acordado e foi quem
-    # iniciou este /wake. Acordamos somente as APIs downstream.
-    # Sequencial evita dois cold starts pesados simultaneamente no plano Free.
-    for name, url in SERVICES.items():
-        results.append(wake_service(name, url))
+    # Os três serviços são chamados em paralelo.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(SERVICES)
+    ) as executor:
+        futures = {
+            executor.submit(wake_service, name, url): name
+            for name, url in SERVICES.items()
+        }
 
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                # Uma exceção inesperada de um serviço não derruba o /wake.
+                result = {
+                    "ok": False,
+                    "service": name,
+                    "status": None,
+                    "attempt": 0,
+                    "elapsed": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(
+                    f"[WAKE] {name}: exceção isolada: {exc}",
+                    flush=True
+                )
+
+            results.append(result)
+
+    results.sort(key=lambda item: item["service"])
     overall_ok = all(item["ok"] for item in results)
+    total_elapsed = time.time() - started
 
-    print("[CENTRAL WAKE] Resultado:", results, flush=True)
+    print(
+        f"[CENTRAL WAKE] Concluído em {total_elapsed:.1f}s. "
+        f"overall_ok={overall_ok}",
+        flush=True
+    )
+    for item in results:
+        print(
+            f"[CENTRAL WAKE] {item['service']} -> "
+            f"HTTP {item.get('status')} | ok={item['ok']} | "
+            f"tentativa={item.get('attempt')} | "
+            f"tempo={item.get('elapsed')}s",
+            flush=True
+        )
     print("========================================", flush=True)
 
-    # Mantemos HTTP 200 para que o Worker consiga enxergar
-    # o resultado individual das APIs sem perder o diagnóstico.
+    # Mantém HTTP 200 para o Worker receber o diagnóstico mesmo quando
+    # uma API downstream estiver fria/indisponível.
     return jsonify({
         "ok": overall_ok,
-        "message": "Serviços downstream acionados pelas rotas reais.",
+        "message": "Serviços acionados em paralelo.",
+        "elapsed": round(total_elapsed, 1),
         "services": results,
     }), 200
 
 
 # Proxy da API Central para o ranking da Kick-Duelo API.
-# O /wake permanece inalterado.
 KICK_DUELO_URL = os.getenv(
     "KICK_DUELO_API_URL",
     "https://kick-duelo-api.onrender.com"
