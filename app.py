@@ -1,140 +1,158 @@
+
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, Response, jsonify, request
+import time
+import concurrent.futures
 import requests
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 SERVICES = {
-    "kick": os.getenv("KICK_API_URL", "https://kick-duelo-api.onrender.com"),
-    "warzone": os.getenv("WARZONE_API_URL", "https://warzone-api-qbn9.onrender.com"),
-    "redsec": os.getenv("REDSEC_API_URL", "https://redsec-loadout-api.onrender.com"),
+    "kick": os.getenv(
+        "KICK_WORKER_URL",
+        "https://sn7-kick-worker.onrender.com"
+    ).strip().rstrip("/"),
+    "redsec": os.getenv(
+        "REDSEC_API_URL",
+        "https://redsec-loadout-api.onrender.com"
+    ).strip().rstrip("/"),
+    "warzone": os.getenv(
+        "WARZONE_API_URL",
+        "https://warzone-api-qbn9.onrender.com"
+    ).strip().rstrip("/"),
 }
 
-TIMEOUT = float(os.getenv("PROXY_TIMEOUT", "20"))
-WAKE_TIMEOUT = float(os.getenv("WAKE_TIMEOUT", "30"))
+# Render Free pode colocar o serviço para dormir.
+# Acordar uma API pode demorar dezenas de segundos.
+REQUEST_TIMEOUT = int(os.getenv("WAKE_REQUEST_TIMEOUT", "75"))
+RETRIES = int(os.getenv("WAKE_RETRIES", "2"))
+RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "3"))
 
-warmup_lock = threading.Lock()
-warmup_running = False
 
-def wake_service(name, url):
-    try:
-        # Root endpoint is known to answer on all three current APIs.
-        r = requests.get(url.rstrip("/") + "/", timeout=WAKE_TIMEOUT)
-        return {"service": name, "status": r.status_code, "ok": r.status_code < 500}
-    except requests.RequestException as e:
-        return {
-            "service": name,
-            "status": None,
-            "ok": False,
-            "error": type(e).__name__,
-            "detail": str(e)[:180],
-        }
-
-def wake_all():
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [
-            pool.submit(wake_service, name, url)
-            for name, url in SERVICES.items()
-        ]
-        return [f.result() for f in futures]
-
-def warm_all_blocking():
-    """Warm all services in parallel; used by the persistent worker."""
-    try:
-        results = wake_all()
-        app.logger.info("Warm-up: %s", results)
-    except Exception as e:
-        app.logger.exception("Warm-up failed: %s", e)
-
-def start_warmup():
+def wake_service(name, base_url):
     """
-    Start a detached warm-up thread.
-
-    It deliberately does not wait for the sleeping APIs. The request that
-    triggered it can return immediately, while this process continues the
-    outbound requests. A lock prevents several chat commands from creating
-    many simultaneous wake storms.
+    Faz GET na raiz da API para provocar cold start.
+    Não depende de existir /wake na API downstream.
     """
-    global warmup_running
-    with warmup_lock:
-        if warmup_running:
-            return False
-        warmup_running = True
+    url = base_url + "/"
+    last_status = None
+    last_error = None
+    started = time.time()
 
-    def runner():
-        global warmup_running
+    for attempt in range(1, RETRIES + 2):
         try:
-            warm_all_blocking()
-        finally:
-            with warmup_lock:
-                warmup_running = False
+            print(
+                f"[WAKE] {name}: tentativa {attempt} -> {url}",
+                flush=True
+            )
 
-    threading.Thread(target=runner, name="api-warmup", daemon=True).start()
-    return True
+            response = requests.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+            last_status = response.status_code
 
+            print(
+                f"[WAKE] {name}: HTTP {response.status_code} "
+                f"em {time.time() - started:.1f}s",
+                flush=True
+            )
 
-def proxy(service, path):
-    if service not in SERVICES:
-        return Response("Serviço não encontrado.", status=404)
+            # Qualquer resposta HTTP significa que o serviço respondeu.
+            # 2xx/3xx é considerado sucesso.
+            if 200 <= response.status_code < 400:
+                return {
+                    "ok": True,
+                    "service": name,
+                    "status": response.status_code,
+                    "attempt": attempt,
+                    "elapsed": round(time.time() - started, 1),
+                }
 
-    # Every proxied command triggers one non-blocking warm-up of all APIs.
-    start_warmup()
+            last_error = (
+                f"HTTP {response.status_code}: "
+                f"{response.text[:300]}"
+            )
 
-    target = SERVICES[service].rstrip("/") + "/" + path.lstrip("/")
-    try:
-        r = requests.get(
-            target,
-            params=request.args,
-            headers={"User-Agent": "api-central-sn7/2.0"},
-            timeout=TIMEOUT,
-        )
-        content_type = r.headers.get("Content-Type", "text/plain; charset=utf-8")
-        return Response(r.content, status=r.status_code, content_type=content_type)
-    except requests.RequestException as e:
-        return Response(
-            f"⚠️ Serviço {service} ainda está acordando. Tente novamente em alguns segundos. ({type(e).__name__})",
-            status=502,
-        )
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[WAKE] {name}: erro na tentativa {attempt}: "
+                f"{last_error}",
+                flush=True
+            )
+
+        if attempt <= RETRIES:
+            time.sleep(RETRY_DELAY)
+
+    return {
+        "ok": False,
+        "service": name,
+        "status": last_status,
+        "attempt": RETRIES + 1,
+        "elapsed": round(time.time() - started, 1),
+        "error": last_error,
+    }
+
 
 @app.get("/")
 def home():
-    return "🌐 API CENTRAL v3 ONLINE • /health • /wake"
+    return jsonify({
+        "ok": True,
+        "service": "api-central-sn7",
+        "version": "wake-retry-root-v2",
+        "services": SERVICES,
+    })
+
 
 @app.get("/health")
 def health():
-    start_warmup()
     return jsonify({
         "ok": True,
-        "service": "api-central",
-        "version": "3.0.0",
-        "services": SERVICES,
-        "routes": ["/wake", "/kick/<rota>", "/warzone/<rota>", "/redsec/<rota>"],
+        "service": "api-central-sn7",
+        "version": "wake-retry-root-v2",
     })
+
 
 @app.get("/wake")
 def wake():
-    # This one waits for all three checks and reports their status.
-    results=[]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures=[pool.submit(wake_service, name, url) for name,url in SERVICES.items()]
-        for f in futures:
-            results.append(f.result())
-    results.sort(key=lambda x:x["service"])
-    return jsonify({"ok": True, "message": "⚡ Serviços acionados em paralelo.", "services": results})
+    print("========================================", flush=True)
+    print("[CENTRAL WAKE] Solicitação recebida.", flush=True)
+    print(
+        f"[CENTRAL WAKE] timeout={REQUEST_TIMEOUT}s "
+        f"retries={RETRIES}",
+        flush=True
+    )
 
-@app.get("/kick/<path:path>")
-def kick_proxy(path):
-    return proxy("kick", path)
+    results = []
 
-@app.get("/warzone/<path:path>")
-def warzone_proxy(path):
-    return proxy("warzone", path)
+    # Paralelo para não somar o tempo de cold start das APIs.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(SERVICES)
+    ) as executor:
+        futures = [
+            executor.submit(wake_service, name, url)
+            for name, url in SERVICES.items()
+        ]
 
-@app.get("/redsec/<path:path>")
-def redsec_proxy(path):
-    return proxy("redsec", path)
+        for future in futures:
+            results.append(future.result())
+
+    overall_ok = all(item["ok"] for item in results)
+
+    print("[CENTRAL WAKE] Resultado:", results, flush=True)
+    print("========================================", flush=True)
+
+    # Mantemos HTTP 200 para que o Worker consiga enxergar
+    # o resultado individual das APIs sem perder o diagnóstico.
+    return jsonify({
+        "ok": overall_ok,
+        "message": "Serviços acionados em paralelo.",
+        "services": results,
+    }), 200
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
