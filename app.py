@@ -21,6 +21,19 @@ SERVICES = {
     ).strip().rstrip("/"),
 }
 
+# Rotas REAIS das APIs usadas pelos comandos do bot.
+# RedSec: !bf -> /classe?arma=...
+# Warzone: !classe/!meta -> /meta?tipo=...
+REDSEC_WAKE_PATH = os.getenv(
+    "REDSEC_WAKE_PATH",
+    "/classe?arma=svd"
+).strip()
+
+WARZONE_WAKE_PATH = os.getenv(
+    "WARZONE_WAKE_PATH",
+    "/meta?tipo=ar"
+).strip()
+
 # Render Free pode colocar o serviço para dormir.
 # Acordar uma API pode demorar dezenas de segundos.
 # Cold start do Render Free.
@@ -31,10 +44,16 @@ RETRY_DELAY = int(os.getenv("WAKE_RETRY_DELAY", "12"))
 
 def wake_service(name, base_url):
     """
-    Faz GET na raiz da API para provocar cold start.
-    Não depende de existir /wake na API downstream.
+    Faz GET em uma rota real da API para provocar cold start.
+    Usa as mesmas rotas que o bot utiliza para entregar os loadouts.
     """
-    url = base_url + "/"
+    if name == "redsec":
+        url = base_url + REDSEC_WAKE_PATH
+    elif name == "warzone":
+        url = base_url + WARZONE_WAKE_PATH
+    else:
+        url = base_url + "/"
+
     last_status = None
     last_error = None
     started = time.time()
@@ -101,7 +120,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-v5-no-self-kick",
+        "version": "wake-v6-real-routes",
         "services": SERVICES,
     })
 
@@ -111,7 +130,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-v5-no-self-kick",
+        "version": "wake-v6-real-routes",
     })
 
 
@@ -142,7 +161,7 @@ def wake():
     # o resultado individual das APIs sem perder o diagnóstico.
     return jsonify({
         "ok": overall_ok,
-        "message": "Serviços acionados em paralelo.",
+        "message": "Serviços downstream acionados pelas rotas reais.",
         "services": results,
     }), 200
 
