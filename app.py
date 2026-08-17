@@ -22,6 +22,11 @@ SERVICES = {
     ).strip().rstrip("/"),
 }
 
+KICK_DUELO_API_URL = os.getenv(
+    "KICK_DUELO_API_URL",
+    "https://kick-duelo-api.onrender.com"
+).strip().rstrip("/")
+
 # Render Free pode colocar o serviço para dormir.
 # Acordar uma API pode demorar dezenas de segundos.
 REQUEST_TIMEOUT = int(os.getenv("WAKE_REQUEST_TIMEOUT", "75"))
@@ -101,7 +106,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v2",
+        "version": "wake-retry-root-v3-kick-ranking",
         "services": SERVICES,
     })
 
@@ -111,8 +116,59 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-retry-root-v2",
+        "version": "wake-retry-root-v3-kick-ranking",
     })
+
+
+@app.get("/kick/ranking")
+def kick_ranking():
+    """
+    Proxy usado pelo comando !rank do StreamElements.
+
+    O comando chama:
+    $(customapi https://api-central-sn7.onrender.com/kick/ranking)
+
+    A Central encaminha para:
+    https://kick-duelo-api.onrender.com/ranking
+    """
+    url = f"{KICK_DUELO_API_URL}/ranking"
+
+    try:
+        print(f"[KICK RANKING] GET {url}", flush=True)
+
+        response = requests.get(
+            url,
+            timeout=60,
+            allow_redirects=True,
+        )
+
+        print(
+            f"[KICK RANKING] HTTP {response.status_code}",
+            flush=True
+        )
+
+        # customapi do StreamElements funciona melhor recebendo
+        # diretamente o texto da API.
+        return (
+            response.text,
+            response.status_code,
+            {
+                "Content-Type": response.headers.get(
+                    "Content-Type",
+                    "text/plain; charset=utf-8"
+                )
+            },
+        )
+
+    except requests.RequestException as exc:
+        print(
+            f"[KICK RANKING] ERRO: {type(exc).__name__}: {exc}",
+            flush=True
+        )
+        return (
+            "❌ Não foi possível consultar o ranking agora.",
+            502,
+        )
 
 
 @app.get("/wake")

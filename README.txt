@@ -41,3 +41,14 @@ warzone -> HTTP 200 -> ok=True
 
 Mesmo que o primeiro request demore por causa do cold start, o endpoint
 fica aguardando a resposta em vez de desistir rapidamente.
+
+
+ATUALIZAÇÃO V3 - KICK RANKING
+- Adicionada a rota GET /kick/ranking.
+- Ela encaminha para KICK_DUELO_API_URL/ranking.
+- Padrão: https://kick-duelo-api.onrender.com/ranking
+- O texto da Kick-Duelo API é devolvido diretamente para o StreamElements.
+- Não altera /wake nem as APIs Warzone/RedSec.
+
+Variável opcional:
+KICK_DUELO_API_URL=https://kick-duelo-api.onrender.com
