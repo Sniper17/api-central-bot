@@ -28,7 +28,7 @@ SERVICES = {
 # A Central fica aguardando a API realmente responder antes de devolver sucesso.
 WAKE_REQUEST_TIMEOUT = max(5.0, float(os.getenv("WAKE_REQUEST_TIMEOUT", "12")))
 WAKE_MAX_WAIT = max(60.0, float(os.getenv("WAKE_MAX_WAIT", "120")))
-WAKE_POLL_INTERVAL = max(2.0, float(os.getenv("WAKE_POLL_INTERVAL", "4")))
+WAKE_POLL_INTERVAL = max(10.0, float(os.getenv("WAKE_POLL_INTERVAL", "10")))
 
 # Mantidos por compatibilidade com variáveis antigas.
 REQUEST_TIMEOUT = WAKE_REQUEST_TIMEOUT
@@ -118,12 +118,13 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-until-ready-v4",
+        "version": "wake-until-ready-v5-10s",
         "services": SERVICES,
         "wake": {
             "timeout_seconds": REQUEST_TIMEOUT,
-            "retries": RETRIES,
-            "retry_delay_seconds": RETRY_DELAY,
+            "max_wait_seconds": WAKE_MAX_WAIT,
+            "poll_interval_seconds": WAKE_POLL_INTERVAL,
+            "mode": "trigger_once_then_check_every_10s",
         },
     })
 
@@ -133,7 +134,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-until-ready-v4",
+        "version": "wake-until-ready-v5-10s",
     })
 
 
