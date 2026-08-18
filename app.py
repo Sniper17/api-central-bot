@@ -37,89 +37,51 @@ RETRY_DELAY = WAKE_POLL_INTERVAL
 
 
 def wake_service(name, base_url):
-    """Acorda uma API Render como uma aba do navegador.
-
-    A requisição raiz pode permanecer aberta durante o cold start. Não usamos
-    timeout curto para desistir: deixamos a conexão esperando e, se o proxy
-    responder 502/503/504 antes do processo terminar, abrimos novamente até
-    completar a janela de 3 minutos.
-    """
+    """Acorda o Render repetindo pequenas aberturas, como fechar/reabrir aba."""
     started = time.time()
     deadline = started + WAKE_MAX_WAIT
     attempt = 0
     last_status = None
     last_error = None
-
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/139.0 Mobile Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "close",
+    }
     while time.time() < deadline:
         attempt += 1
-        remaining = max(1.0, deadline - time.time())
-
+        remaining = max(0.5, deadline - time.time())
         try:
-            print(
-                f"[WAKE] {name}: abrindo {base_url}/ como navegador "
-                f"(tentativa {attempt}, restante {remaining:.1f}s)",
-                flush=True,
-            )
+            wake_url = f"{base_url}/?sn7_wake={int(time.time()*1000)}-{attempt}"
+            print(f"[WAKE] {name}: abrindo como navegador tentativa={attempt} restante={remaining:.1f}s", flush=True)
             response = requests.get(
-                base_url + "/",
-                timeout=remaining,
+                wake_url,
+                timeout=min(6.0, remaining),
                 allow_redirects=True,
-                headers={"User-Agent": "SN7-Central-Browser-Wake/8.0"},
+                headers=browser_headers,
             )
             last_status = response.status_code
             elapsed = time.time() - started
-
-            print(
-                f"[WAKE] {name}: HTTP {response.status_code} "
-                f"em {elapsed:.1f}s (tentativa {attempt})",
-                flush=True,
-            )
-
-            # Qualquer resposta abaixo de 500 confirma que o container está
-            # atendendo. O root pode ser 404 em alguma API e ainda assim estar
-            # totalmente acordado para o endpoint do comando.
+            print(f"[WAKE] {name}: HTTP {response.status_code} em {elapsed:.1f}s", flush=True)
             if response.status_code < 500:
-                return {
-                    "ok": True,
-                    "service": name,
-                    "status": response.status_code,
-                    "attempt": attempt,
-                    "elapsed": round(elapsed, 1),
-                }
-
-            last_error = (
-                f"HTTP {response.status_code}: {response.text[:300]}"
-            )
-            print(
-                f"[WAKE] {name}: Render ainda acordando "
-                f"(HTTP {response.status_code}). Nova abertura em 3s.",
-                flush=True,
-            )
-
+                return {"ok": True, "service": name, "status": response.status_code, "attempt": attempt, "elapsed": round(elapsed,1)}
+            last_error = f"HTTP {response.status_code}"
+            print(f"[WAKE] {name}: ainda acordando; fechando tentativa e reabrindo em 2s.", flush=True)
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            print(
-                f"[WAKE] {name}: conexão ainda não pronta: {last_error}",
-                flush=True,
-            )
-
+            print(f"[WAKE] {name}: tentativa fechada sem resposta: {last_error}", flush=True)
         if time.time() >= deadline:
             break
-        time.sleep(min(3.0, max(0.1, deadline - time.time())))
-
-    elapsed = time.time() - started
-    print(
-        f"[WAKE] {name}: não ficou pronto dentro de {elapsed:.1f}s.",
-        flush=True,
-    )
-    return {
-        "ok": False,
-        "service": name,
-        "status": last_status,
-        "attempt": attempt,
-        "elapsed": round(elapsed, 1),
-        "error": last_error or "tempo máximo de espera atingido",
-    }
+        time.sleep(min(2.0, max(0.1, deadline-time.time())))
+    elapsed=time.time()-started
+    print(f"[WAKE] {name}: não ficou pronto em {elapsed:.1f}s.", flush=True)
+    return {"ok": False, "service": name, "status": last_status, "attempt": attempt, "elapsed": round(elapsed,1), "error": last_error or "tempo máximo"}
 
 
 @app.get("/")
