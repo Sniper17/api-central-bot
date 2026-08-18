@@ -3,4 +3,4 @@ services:
     name: api-central-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 210 app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 95 app:app
