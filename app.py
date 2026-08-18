@@ -138,6 +138,54 @@ def health():
     })
 
 
+@app.get("/wake/trigger")
+def wake_trigger_alias():
+    """Compatibilidade: o Worker usa /wake/trigger."""
+    return wake_trigger()
+
+
+@app.get("/trigger")
+def wake_trigger():
+    """Dispara o cold start sem manter a requisição aberta até a API acordar."""
+    requested = (request.args.get("service") or "").strip().lower()
+    selected = SERVICES if not requested or requested == "all" else {requested: SERVICES.get(requested, "")}
+    if requested and requested not in SERVICES and requested != "all":
+        return jsonify({"ok": False, "error": f"Serviço inválido: {requested}", "available": sorted(SERVICES)}), 400
+
+    results = []
+    for name, base_url in selected.items():
+        if not base_url:
+            continue
+        try:
+            # Um timeout curto é intencional: o objetivo aqui é só iniciar o
+            # cold start. A confirmação acontece em /status a cada 10s.
+            r = requests.get(base_url + "/", timeout=min(5.0, WAKE_REQUEST_TIMEOUT), allow_redirects=True)
+            results.append({"service": name, "status": r.status_code, "triggered": True})
+            print(f"[TRIGGER] {name}: HTTP {r.status_code}", flush=True)
+        except requests.RequestException as exc:
+            results.append({"service": name, "status": None, "triggered": True, "error": f"{type(exc).__name__}: {exc}"})
+            print(f"[TRIGGER] {name}: cold start disparado/timeout curto: {exc}", flush=True)
+
+    return jsonify({"ok": True, "message": "Cold start disparado.", "services": results}), 202
+
+
+@app.get("/status")
+def wake_status():
+    """Checa se o serviço já está realmente respondendo. Esta rota é curta."""
+    requested = (request.args.get("service") or "").strip().lower()
+    if requested not in SERVICES:
+        return jsonify({"ready": False, "error": "Informe service=kick|redsec|warzone"}), 400
+    base_url = SERVICES[requested]
+    try:
+        r = requests.get(base_url + "/", timeout=min(8.0, WAKE_REQUEST_TIMEOUT), allow_redirects=True)
+        ready = 200 <= r.status_code < 400
+        print(f"[STATUS] {requested}: HTTP {r.status_code} ready={ready}", flush=True)
+        return jsonify({"ready": ready, "service": requested, "status": r.status_code}), 200
+    except requests.RequestException as exc:
+        print(f"[STATUS] {requested}: ainda iniciando ({type(exc).__name__})", flush=True)
+        return jsonify({"ready": False, "service": requested, "status": None}), 200
+
+
 @app.get("/wake")
 def wake():
     """
