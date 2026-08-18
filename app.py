@@ -37,8 +37,13 @@ RETRY_DELAY = WAKE_POLL_INTERVAL
 
 
 def wake_service(name, base_url):
-    """Acorda uma API e só retorna sucesso quando ela estiver respondendo."""
-    url = base_url + "/"
+    """Acorda uma API Render como uma aba do navegador.
+
+    A requisição raiz pode permanecer aberta durante o cold start. Não usamos
+    timeout curto para desistir: deixamos a conexão esperando e, se o proxy
+    responder 502/503/504 antes do processo terminar, abrimos novamente até
+    completar a janela de 3 minutos.
+    """
     started = time.time()
     deadline = started + WAKE_MAX_WAIT
     attempt = 0
@@ -47,31 +52,33 @@ def wake_service(name, base_url):
 
     while time.time() < deadline:
         attempt += 1
-        attempt_started = time.time()
         remaining = max(1.0, deadline - time.time())
-        timeout = min(WAKE_REQUEST_TIMEOUT, remaining)
 
         try:
             print(
-                f"[WAKE] {name}: tentativa {attempt} -> {url} "
-                f"(restam {remaining:.1f}s)",
+                f"[WAKE] {name}: abrindo {base_url}/ como navegador "
+                f"(tentativa {attempt}, restante {remaining:.1f}s)",
                 flush=True,
             )
             response = requests.get(
-                url,
-                timeout=timeout,
+                base_url + "/",
+                timeout=remaining,
                 allow_redirects=True,
+                headers={"User-Agent": "SN7-Central-Browser-Wake/8.0"},
             )
             last_status = response.status_code
             elapsed = time.time() - started
 
             print(
                 f"[WAKE] {name}: HTTP {response.status_code} "
-                f"em {time.time()-attempt_started:.1f}s (total {elapsed:.1f}s)",
+                f"em {elapsed:.1f}s (tentativa {attempt})",
                 flush=True,
             )
 
-            if 200 <= response.status_code < 400:
+            # Qualquer resposta abaixo de 500 confirma que o container está
+            # atendendo. O root pode ser 404 em alguma API e ainda assim estar
+            # totalmente acordado para o endpoint do comando.
+            if response.status_code < 500:
                 return {
                     "ok": True,
                     "service": name,
@@ -80,23 +87,25 @@ def wake_service(name, base_url):
                     "elapsed": round(elapsed, 1),
                 }
 
-            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+            last_error = (
+                f"HTTP {response.status_code}: {response.text[:300]}"
+            )
+            print(
+                f"[WAKE] {name}: Render ainda acordando "
+                f"(HTTP {response.status_code}). Nova abertura em 3s.",
+                flush=True,
+            )
 
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             print(
-                f"[WAKE] {name}: erro na tentativa {attempt}: {last_error}",
+                f"[WAKE] {name}: conexão ainda não pronta: {last_error}",
                 flush=True,
             )
 
-        if time.time() + WAKE_POLL_INTERVAL >= deadline:
+        if time.time() >= deadline:
             break
-        print(
-            f"[WAKE] {name}: ainda iniciando. Nova verificação em "
-            f"{WAKE_POLL_INTERVAL:.1f}s.",
-            flush=True,
-        )
-        time.sleep(WAKE_POLL_INTERVAL)
+        time.sleep(min(3.0, max(0.1, deadline - time.time())))
 
     elapsed = time.time() - started
     print(
@@ -118,13 +127,13 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-trigger-status-v6.2",
+        "version": "browser-wake-v8.0",
         "services": SERVICES,
         "wake": {
             "timeout_seconds": REQUEST_TIMEOUT,
             "max_wait_seconds": WAKE_MAX_WAIT,
             "poll_interval_seconds": WAKE_POLL_INTERVAL,
-            "mode": "trigger_once_then_check_every_10s",
+            "mode": "browser_style_direct_wake_until_ready",
         },
     })
 
@@ -134,7 +143,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-trigger-status-v6.2",
+        "version": "browser-wake-v8.0",
     })
 
 
