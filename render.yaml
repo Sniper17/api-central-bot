@@ -1,15 +1,6 @@
 services:
   - type: web
     name: api-central-bot
-    runtime: python
-    plan: free
+    env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --timeout 180 --workers 1 --threads 2 app:app
-    autoDeploy: true
-    envVars:
-      - key: KICK_API_URL
-        value: https://kick-duelo-api.onrender.com
-      - key: WARZONE_API_URL
-        value: https://warzone-api-qbn9.onrender.com
-      - key: REDSEC_API_URL
-        value: https://redsec-loadout-api.onrender.com
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 210 app:app
