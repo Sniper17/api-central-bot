@@ -1,244 +1,344 @@
 import os
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-
+import concurrent.futures
 import requests
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
 SERVICES = {
-    "kick": os.getenv("KICK_API_URL", "https://kick-duelo-api.onrender.com").rstrip("/"),
-    "warzone": os.getenv("WARZONE_API_URL", "https://warzone-api-qbn9.onrender.com").rstrip("/"),
-    "redsec": os.getenv("REDSEC_API_URL", "https://redsec-loadout-api.onrender.com").rstrip("/"),
+    "kick": os.getenv(
+        "KICK_WORKER_URL",
+        "https://sn7-kick-worker.onrender.com"
+    ).strip().rstrip("/"),
+    "redsec": os.getenv(
+        "REDSEC_API_URL",
+        "https://redsec-loadout-api.onrender.com"
+    ).strip().rstrip("/"),
+    "warzone": os.getenv(
+        "WARZONE_API_URL",
+        "https://warzone-api-qbn9.onrender.com"
+    ).strip().rstrip("/"),
 }
 
-WAKE_PATHS = {
-    "kick": os.getenv("KICK_WAKE_PATH", "/"),
-    "warzone": os.getenv("WARZONE_WAKE_PATH", "/"),
-    "redsec": os.getenv("REDSEC_WAKE_PATH", "/"),
-}
+# Acordar uma API do Render pode levar alguns segundos.
+# O /wake precisa terminar antes do timeout do worker da Central.
+# Os requests são curtos e independentes: uma API ruim não trava as outras.
+# O Render Free pode levar cerca de um minuto para sair do cold start.
+# A Central fica aguardando a API realmente responder antes de devolver sucesso.
+WAKE_REQUEST_TIMEOUT = max(5.0, float(os.getenv("WAKE_REQUEST_TIMEOUT", "12")))
+WAKE_MAX_WAIT = max(60.0, min(180.0, float(os.getenv("WAKE_MAX_WAIT", "180"))))
+WAKE_POLL_INTERVAL = max(10.0, float(os.getenv("WAKE_POLL_INTERVAL", "10")))
 
-# Importante: o Render pode encerrar uma requisição HTTP longa antes de 3 minutos.
-# Por isso não bloqueamos 180s em uma única chamada. A Central acorda em background
-# e tenta o comando real várias vezes por uma janela total configurável.
-TOTAL_RETRY_WINDOW = min(max(int(os.getenv("COMMAND_RETRY_WINDOW", "90")), 30), 95)
-RETRY_INTERVAL = min(max(float(os.getenv("COMMAND_RETRY_INTERVAL", "5")), 2), 10)
-CONNECT_TIMEOUT = 5
-REQUEST_TIMEOUT = min(max(int(os.getenv("COMMAND_REQUEST_TIMEOUT", "12")), 5), 20)
-WAKE_TIMEOUT = min(max(int(os.getenv("WAKE_REQUEST_TIMEOUT", "20")), 8), 30)
-WAKE_COOLDOWN = min(max(int(os.getenv("WAKE_COOLDOWN", "15")), 0), 120)
-
-_executor = ThreadPoolExecutor(max_workers=8)
-_wake_lock = threading.Lock()
-_last_wake = {name: 0.0 for name in SERVICES}
+# Mantidos por compatibilidade com variáveis antigas.
+REQUEST_TIMEOUT = WAKE_REQUEST_TIMEOUT
+RETRIES = int(os.getenv("WAKE_RETRIES", "0"))
+RETRY_DELAY = WAKE_POLL_INTERVAL
 
 
-def wake_url(name):
-    path = WAKE_PATHS[name] or "/"
-    if not path.startswith("/"):
-        path = "/" + path
-    return SERVICES[name] + path
-
-
-def wake_service(name, force=False):
-    """Faz um pedido curto para tirar o serviço do cold start."""
-    now = time.monotonic()
-    with _wake_lock:
-        if not force and now - _last_wake[name] < WAKE_COOLDOWN:
-            return {"service": name, "skipped": True}
-        _last_wake[name] = now
-
-    try:
-        started = time.monotonic()
-        r = requests.get(
-            wake_url(name),
-            timeout=(CONNECT_TIMEOUT, WAKE_TIMEOUT),
-            headers={"User-Agent": "SN7-Central-Wake/3.0"},
-        )
-        elapsed = round(time.monotonic() - started, 2)
-        print(f"[WAKE] {name} HTTP {r.status_code} em {elapsed}s", flush=True)
-        return {"service": name, "status": r.status_code, "elapsed": elapsed}
-    except requests.RequestException as exc:
-        elapsed = round(time.monotonic() - started, 2)
-        print(f"[WAKE] {name} ainda acordando ({elapsed}s): {exc}", flush=True)
-        return {"service": name, "status": None, "elapsed": elapsed, "error": str(exc)}
-
-
-def schedule_wake(name, force=False):
-    if name not in SERVICES:
-        return False
-    _executor.submit(wake_service, name, force)
-    return True
-
-
-def wake_all(force=False):
-    for name in SERVICES:
-        schedule_wake(name, force=force)
-    return True
-
-
-def build_target(service, subpath):
-    target = SERVICES[service] + "/" + subpath.lstrip("/")
-    if request.query_string:
-        target += "?" + request.query_string.decode("utf-8", errors="ignore")
-    return target
-
-
-def clean_headers():
-    return {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in {"host", "content-length", "connection"}
-    }
-
-
-def friendly_failure(service, elapsed):
-    # Nunca devolve o HTML gigante de erro do Render para o chat.
-    return Response(
-        f"⚠️ {service.capitalize()} ainda está iniciando. A tentativa levou {int(elapsed)}s. Tente o comando novamente em alguns segundos.",
-        status=503,
-        content_type="text/plain; charset=utf-8",
-    )
-
-
-def proxy_with_retry(service, target):
-    """Acorda e tenta o comando real repetidamente.
-
-    Isso é mais confiável que esperar 180s numa única requisição. Se o Render
-    devolver 502/503/504 durante o cold start, esperamos e tentamos novamente.
-    Assim que a API estiver viva, o POST/GET original é enviado normalmente.
-    """
-    body = request.get_data()
-    headers = clean_headers()
-    method = request.method
-    deadline = time.monotonic() + TOTAL_RETRY_WINDOW
+def wake_service(name, base_url):
+    """Acorda uma API e só retorna sucesso quando ela estiver respondendo."""
+    url = base_url + "/"
+    started = time.time()
+    deadline = started + WAKE_MAX_WAIT
     attempt = 0
     last_status = None
+    last_error = None
 
-    while time.monotonic() < deadline:
+    while time.time() < deadline:
         attempt += 1
-        remaining = max(1, deadline - time.monotonic())
-        timeout = min(REQUEST_TIMEOUT, remaining)
+        attempt_started = time.time()
+        remaining = max(1.0, deadline - time.time())
+        timeout = min(WAKE_REQUEST_TIMEOUT, remaining)
+
         try:
-            started = time.monotonic()
-            r = requests.request(
-                method=method,
-                url=target,
-                headers=headers,
-                data=body,
-                timeout=(CONNECT_TIMEOUT, timeout),
-                allow_redirects=False,
-            )
-            elapsed_req = round(time.monotonic() - started, 2)
-            last_status = r.status_code
             print(
-                f"[PROXY] {service} tentativa {attempt} -> HTTP {r.status_code} em {elapsed_req}s",
+                f"[WAKE] {name}: tentativa {attempt} -> {url} "
+                f"(restam {remaining:.1f}s)",
+                flush=True,
+            )
+            response = requests.get(
+                url,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            last_status = response.status_code
+            elapsed = time.time() - started
+
+            print(
+                f"[WAKE] {name}: HTTP {response.status_code} "
+                f"em {time.time()-attempt_started:.1f}s (total {elapsed:.1f}s)",
                 flush=True,
             )
 
-            # 2xx/3xx/4xx do próprio endpoint são respostas reais: não repetir.
-            # Só repetimos os erros típicos do cold start/proxy do Render.
-            if r.status_code not in {502, 503, 504}:
-                excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-                response_headers = [(k, v) for k, v in r.headers.items() if k.lower() not in excluded]
-                return Response(
-                    r.content,
-                    status=r.status_code,
-                    headers=response_headers,
-                    content_type=r.headers.get("content-type"),
-                )
+            if 200 <= response.status_code < 400:
+                return {
+                    "ok": True,
+                    "service": name,
+                    "status": response.status_code,
+                    "attempt": attempt,
+                    "elapsed": round(elapsed, 1),
+                }
+
+            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
 
         except requests.RequestException as exc:
-            print(f"[PROXY] {service} tentativa {attempt} sem resposta: {exc}", flush=True)
+            last_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[WAKE] {name}: erro na tentativa {attempt}: {last_error}",
+                flush=True,
+            )
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if time.time() + WAKE_POLL_INTERVAL >= deadline:
             break
-        time.sleep(min(RETRY_INTERVAL, remaining))
+        print(
+            f"[WAKE] {name}: ainda iniciando. Nova verificação em "
+            f"{WAKE_POLL_INTERVAL:.1f}s.",
+            flush=True,
+        )
+        time.sleep(WAKE_POLL_INTERVAL)
 
-    elapsed = TOTAL_RETRY_WINDOW
-    print(f"[PROXY] {service} não acordou dentro da janela de {elapsed}s. último status={last_status}", flush=True)
-    return friendly_failure(service, elapsed)
+    elapsed = time.time() - started
+    print(
+        f"[WAKE] {name}: não ficou pronto dentro de {elapsed:.1f}s.",
+        flush=True,
+    )
+    return {
+        "ok": False,
+        "service": name,
+        "status": last_status,
+        "attempt": attempt,
+        "elapsed": round(elapsed, 1),
+        "error": last_error or "tempo máximo de espera atingido",
+    }
 
 
 @app.get("/")
-def index():
+def home():
     return jsonify({
-        "online": True,
-        "service": "API Central",
-        "version": "wake-gambiarra-3.0",
+        "ok": True,
+        "service": "api-central-sn7",
+        "version": "wake-trigger-status-v6.2",
         "services": SERVICES,
-        "command_retry_window": TOTAL_RETRY_WINDOW,
+        "wake": {
+            "timeout_seconds": REQUEST_TIMEOUT,
+            "max_wait_seconds": WAKE_MAX_WAIT,
+            "poll_interval_seconds": WAKE_POLL_INTERVAL,
+            "mode": "trigger_once_then_check_every_10s",
+        },
     })
 
 
 @app.get("/health")
 def health():
-    wake_all()
     return jsonify({
-        "online": True,
-        "wake_triggered": list(SERVICES.keys()),
-        "message": "Kick, Warzone e RedSec receberam wake em background.",
-    }), 200
+        "ok": True,
+        "service": "api-central-sn7",
+        "version": "wake-trigger-status-v6.2",
+    })
+
+
+
+def _trigger_one(name, base_url):
+    """Faz somente o primeiro toque no Render; não espera a aplicação ficar pronta."""
+    try:
+        r = requests.get(
+            base_url + "/",
+            timeout=min(6.0, WAKE_REQUEST_TIMEOUT),
+            allow_redirects=True,
+            headers={"User-Agent": "SN7-Central-Trigger/6.2"},
+        )
+        print(f"[TRIGGER] {name}: HTTP {r.status_code}", flush=True)
+        return {"service": name, "status": r.status_code, "triggered": True}
+    except requests.RequestException as exc:
+        print(
+            f"[TRIGGER] {name}: cold start disparado/timeout curto: {exc}",
+            flush=True,
+        )
+        return {
+            "service": name,
+            "status": None,
+            "triggered": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+@app.get("/wake/trigger")
+def wake_trigger_alias():
+    """Compatibilidade: o Worker usa /wake/trigger."""
+    return wake_trigger()
+
+
+@app.get("/trigger")
+def wake_trigger():
+    """Dispara o cold start sem manter a requisição aberta até a API acordar."""
+    requested = (request.args.get("service") or "").strip().lower()
+    selected = SERVICES if not requested or requested == "all" else {requested: SERVICES.get(requested, "")}
+    if requested and requested not in SERVICES and requested != "all":
+        return jsonify({"ok": False, "error": f"Serviço inválido: {requested}", "available": sorted(SERVICES)}), 400
+
+    # Dispara todos em paralelo. Isso é importante porque o Worker usa um
+    # timeout curto no /trigger e não pode ficar preso esperando três APIs.
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(selected))) as executor:
+        futures = {}
+        for name, base_url in selected.items():
+            if base_url:
+                futures[executor.submit(_trigger_one, name, base_url)] = name
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                name = futures[future]
+                results.append({
+                    "service": name,
+                    "status": None,
+                    "triggered": True,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+    results.sort(key=lambda item: item["service"])
+    return jsonify({"ok": True, "message": "Cold start disparado.", "services": results}), 202
+
+
+@app.get("/wake/status")
+def wake_status_alias():
+    """Compatibilidade: o Worker consulta /wake/status."""
+    return wake_status()
+
+
+@app.get("/status")
+def wake_status():
+    """Checa se o serviço já está realmente respondendo. Esta rota é curta."""
+    requested = (request.args.get("service") or "").strip().lower()
+    if requested not in SERVICES:
+        return jsonify({"ready": False, "error": "Informe service=kick|redsec|warzone"}), 400
+    base_url = SERVICES[requested]
+    try:
+        r = requests.get(base_url + "/", timeout=min(8.0, WAKE_REQUEST_TIMEOUT), allow_redirects=True)
+        ready = 200 <= r.status_code < 400
+        print(f"[STATUS] {requested}: HTTP {r.status_code} ready={ready}", flush=True)
+        return jsonify({"ready": ready, "service": requested, "status": r.status_code}), 200
+    except requests.RequestException as exc:
+        print(f"[STATUS] {requested}: ainda iniciando ({type(exc).__name__})", flush=True)
+        return jsonify({"ready": False, "service": requested, "status": None}), 200
 
 
 @app.get("/wake")
 def wake():
-    service = (request.args.get("service") or "").strip().lower()
-    force = request.args.get("force") in {"1", "true", "yes"}
-    if service:
-        if service not in SERVICES:
-            return jsonify({"ok": False, "error": "service inválido"}), 400
-        schedule_wake(service, force=force)
-        return jsonify({"ok": True, "wake_triggered": [service]}), 202
-    wake_all(force=force)
-    return jsonify({"ok": True, "wake_triggered": list(SERVICES.keys())}), 202
+    """
+    /wake sem parâmetro acorda os três serviços em paralelo.
+    /wake?service=redsec ou /wake?service=warzone acorda somente o alvo
+    necessário para um comando, aguardando ele ficar realmente pronto.
+    """
+    requested = (request.args.get("service") or "").strip().lower()
+    if requested and requested not in SERVICES:
+        return jsonify({
+            "ok": False,
+            "error": f"Serviço inválido: {requested}",
+            "available": sorted(SERVICES),
+        }), 400
 
+    selected = {requested: SERVICES[requested]} if requested else SERVICES
 
-@app.get("/wake/<service>")
-def wake_service_route(service):
-    service = service.lower()
-    if service not in SERVICES:
-        return jsonify({"ok": False, "error": "service inválido"}), 400
-    schedule_wake(service, force=True)
-    return jsonify({"ok": True, "wake_triggered": [service]}), 202
+    print("========================================", flush=True)
+    print("[CENTRAL WAKE] Solicitação recebida.", flush=True)
+    print(
+        f"[CENTRAL WAKE] alvo={requested or 'todos'} "
+        f"max_wait={WAKE_MAX_WAIT}s poll={WAKE_POLL_INTERVAL}s",
+        flush=True,
+    )
 
+    started = time.time()
+    results = []
 
-@app.route(
-    "/<service>", defaults={"subpath": ""},
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
-)
-@app.route(
-    "/<service>/<path:subpath>",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
-)
-def proxy(service, subpath):
-    service = service.lower()
-    if service not in SERVICES:
-        return jsonify({"error": "service não encontrado"}), 404
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(selected)
+    ) as executor:
+        futures = {
+            executor.submit(wake_service, name, url): name
+            for name, url in selected.items()
+        }
 
-    # Primeiro dispara o wake sem bloquear. Depois já tentamos o endpoint real.
-    # Se a API estiver dormindo, os 502/503/504 são repetidos automaticamente.
-    schedule_wake(service)
-    target = build_target(service, subpath)
-    print(f"[COMMAND] {service} -> {target}", flush=True)
-    return proxy_with_retry(service, target)
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "service": name,
+                    "status": None,
+                    "attempt": 0,
+                    "elapsed": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(f"[WAKE] {name}: exceção isolada: {exc}", flush=True)
+            results.append(result)
 
+    results.sort(key=lambda item: item["service"])
+    overall_ok = all(item["ok"] for item in results)
+    total_elapsed = time.time() - started
 
-@app.get("/status")
-def status():
+    print(
+        f"[CENTRAL WAKE] Concluído em {total_elapsed:.1f}s. "
+        f"overall_ok={overall_ok}",
+        flush=True,
+    )
+    for item in results:
+        print(
+            f"[CENTRAL WAKE] {item['service']} -> HTTP {item.get('status')} | "
+            f"ok={item['ok']} | tentativa={item.get('attempt')} | "
+            f"tempo={item.get('elapsed')}s",
+            flush=True,
+        )
+    print("========================================", flush=True)
+
     return jsonify({
-        "online": True,
-        "version": "wake-gambiarra-3.0",
-        "command_retry_window": TOTAL_RETRY_WINDOW,
-        "retry_interval": RETRY_INTERVAL,
-        "services": {
-            name: {"url": url, "wake_path": WAKE_PATHS[name]}
-            for name, url in SERVICES.items()
-        },
-    })
+        "ok": overall_ok,
+        "message": "Serviço pronto." if requested else "Serviços prontos.",
+        "elapsed": round(total_elapsed, 1),
+        "services": results,
+    }), 200
+
+
+# Proxy da API Central para o ranking da Kick-Duelo API.
+KICK_DUELO_URL = os.getenv(
+    "KICK_DUELO_API_URL",
+    "https://kick-duelo-api.onrender.com"
+).strip().rstrip("/")
+
+
+@app.get("/kick/ranking")
+def kick_ranking():
+    """Encaminha /kick/ranking para a rota /ranking da Kick-Duelo API."""
+    url = KICK_DUELO_URL + "/ranking"
+    try:
+        response = requests.get(
+            url,
+            timeout=int(os.getenv("KICK_RANKING_TIMEOUT", "75")),
+            allow_redirects=True,
+        )
+
+        print(
+            f"[KICK RANKING] {url} -> HTTP {response.status_code}",
+            flush=True
+        )
+
+        content_type = response.headers.get(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+
+        return response.text, response.status_code, {
+            "Content-Type": content_type
+        }
+
+    except requests.RequestException as exc:
+        print(f"[KICK RANKING] erro: {exc}", flush=True)
+        return f"unable to make request: {exc}", 502
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
