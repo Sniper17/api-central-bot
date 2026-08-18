@@ -118,7 +118,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-until-ready-v5-10s",
+        "version": "wake-trigger-status-v6.1",
         "services": SERVICES,
         "wake": {
             "timeout_seconds": REQUEST_TIMEOUT,
@@ -134,7 +134,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "api-central-sn7",
-        "version": "wake-until-ready-v5-10s",
+        "version": "wake-trigger-status-v6.1",
     })
 
 
@@ -167,6 +167,12 @@ def wake_trigger():
             print(f"[TRIGGER] {name}: cold start disparado/timeout curto: {exc}", flush=True)
 
     return jsonify({"ok": True, "message": "Cold start disparado.", "services": results}), 202
+
+
+@app.get("/wake/status")
+def wake_status_alias():
+    """Compatibilidade: o Worker consulta /wake/status."""
+    return wake_status()
 
 
 @app.get("/status")
